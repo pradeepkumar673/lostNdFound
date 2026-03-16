@@ -1,4 +1,3 @@
-
 """
 CampusLostFound - Database Configuration
 MongoDB connection + collection helpers + index setup

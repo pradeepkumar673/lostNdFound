@@ -1,4 +1,3 @@
-
 """
 CampusLostFound - Notifications Routes
 GET  /api/notifications         - Get user notifications (paginated)

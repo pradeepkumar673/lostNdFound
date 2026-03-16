@@ -1,22 +1,37 @@
 """
-CampusLostFound - Utility Helpers
-Serialization, pagination, and common helpers.
+backend/utils/helpers.py
+Serialization, pagination, and shared utilities.
+
+Changes v2:
+  • Full type hints
+  • serialize_doc handles nested lists of dicts correctly
+  • paginate_query returns typed dict
 """
 
-from bson import ObjectId
+from __future__ import annotations
+
 from datetime import datetime
-import re
+from typing import Any
+
+from bson import ObjectId
 
 
-def serialize_doc(doc):
+def serialize_doc(doc: dict | None) -> dict | None:
     """
-    Convert a MongoDB document to a JSON-serializable dict.
-    Converts ObjectId → string, datetime → ISO string.
+    Recursively convert a MongoDB document to a JSON-serializable dict.
+
+    Conversions:
+        ObjectId  → str
+        datetime  → ISO-8601 str
+        dict      → recursively serialized
+        list      → elements serialized individually
+
+    Returns None if doc is None.
     """
     if doc is None:
         return None
 
-    result = {}
+    result: dict[str, Any] = {}
     for key, value in doc.items():
         if isinstance(value, ObjectId):
             result[key] = str(value)
@@ -26,8 +41,8 @@ def serialize_doc(doc):
             result[key] = serialize_doc(value)
         elif isinstance(value, list):
             result[key] = [
-                serialize_doc(v) if isinstance(v, dict)
-                else str(v)      if isinstance(v, ObjectId)
+                serialize_doc(v)   if isinstance(v, dict)
+                else str(v)        if isinstance(v, ObjectId)
                 else v.isoformat() if isinstance(v, datetime)
                 else v
                 for v in value
@@ -35,19 +50,32 @@ def serialize_doc(doc):
         else:
             result[key] = value
 
-    # Always expose _id as both "_id" and "id"
+    # Expose _id as both "_id" and "id" for frontend convenience
     if "_id" in result:
         result["id"] = result["_id"]
 
     return result
 
 
-def paginate_query(collection, query, page=1, limit=12, sort=None):
+def paginate_query(
+    collection,
+    query: dict,
+    page:  int = 1,
+    limit: int = 12,
+    sort:  list | None = None,
+) -> dict[str, Any]:
     """
-    Helper to paginate a MongoDB query.
+    Paginate a MongoDB collection query.
+
+    Args:
+        collection: PyMongo collection object.
+        query:      Filter dict.
+        page:       1-based page number.
+        limit:      Items per page.
+        sort:       List of (field, direction) tuples. Defaults to newest-first.
 
     Returns:
-        { items: [...], pagination: { total, page, limit, total_pages, has_next, has_prev } }
+        Dict with ``items`` and ``pagination`` keys.
     """
     sort  = sort or [("created_at", -1)]
     skip  = (page - 1) * limit
@@ -63,5 +91,5 @@ def paginate_query(collection, query, page=1, limit=12, sort=None):
             "total_pages": max(1, (total + limit - 1) // limit),
             "has_next":    (page * limit) < total,
             "has_prev":    page > 1,
-        }
+        },
     }

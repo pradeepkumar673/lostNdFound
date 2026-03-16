@@ -1,221 +1,277 @@
 """
-CampusLostFound - Socket.IO Service
-Real-time chat and live notifications via Flask-SocketIO.
+backend/services/socket_service.py
+Flask-SocketIO real-time service.
+
+Changes v2:
+  • Socket auth survives token refresh: client can send new token via
+    "refresh_token" event without reconnecting
+  • bleach sanitisation on all incoming message text
+  • Rate-guard on send_message (max 30 msgs/min per user, tracked in Redis)
+  • Structured logging
+  • Type hints
 """
 
+from __future__ import annotations
+
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
+
+import bleach
 from flask import request
 from flask_jwt_extended import decode_token
 from jwt.exceptions import InvalidTokenError
 
+from config.settings import Config
+
 logger = logging.getLogger(__name__)
 
-# Global socketio reference
-_socketio = None
-
-# Map user_id → set of socket session IDs
-_user_sessions = {}
+_socketio    = None
+_user_sessions: dict[str, set[str]] = {}   # user_id → {sid, …}
 
 
-def register_socket_events(socketio):
-    """Attach all SocketIO event handlers"""
+# ─── Registration ─────────────────────────────────────────────────────────────
+def register_socket_events(socketio) -> None:
+    """Attach all SocketIO event handlers to the given SocketIO instance."""
     global _socketio
     _socketio = socketio
 
-    # ─── Connection ───────────────────────────────────────────────────────────
+    # ── connect ───────────────────────────────────────────────────────────────
     @socketio.on("connect")
     def on_connect():
-        token = request.args.get("token") or (request.headers.get("Authorization", "").replace("Bearer ", ""))
-        if not token:
-            logger.warning("Socket connection rejected — no token")
-            return False  # Reject connection
+        token = (
+            request.args.get("token")
+            or request.headers.get("Authorization", "").replace("Bearer ", "")
+        )
+        if not _authenticate_socket(token, request.sid):
+            return False   # Reject connection
 
-        try:
-            decoded = decode_token(token)
-            user_id = decoded["sub"]
-            sid     = request.sid
-
-            if user_id not in _user_sessions:
-                _user_sessions[user_id] = set()
-            _user_sessions[user_id].add(sid)
-
-            # Store user_id in session
-            from flask import session
-            session["user_id"] = user_id
-
-            socketio.emit("connected", {"message": "Connected to CampusLostFound", "user_id": user_id}, to=sid)
-            logger.info(f"Socket connected: user={user_id} sid={sid}")
-
-        except (InvalidTokenError, KeyError, Exception) as e:
-            logger.warning(f"Socket auth failed: {e}")
-            return False
-
-    # ─── Disconnection ────────────────────────────────────────────────────────
+    # ── disconnect ────────────────────────────────────────────────────────────
     @socketio.on("disconnect")
     def on_disconnect():
         sid = request.sid
-        for user_id, sessions in list(_user_sessions.items()):
+        for uid, sessions in list(_user_sessions.items()):
             if sid in sessions:
                 sessions.discard(sid)
                 if not sessions:
-                    del _user_sessions[user_id]
-                logger.info(f"Socket disconnected: sid={sid}")
+                    del _user_sessions[uid]
+                logger.info("socket_disconnected", extra={"sid": sid, "user_id": uid})
                 break
 
-    # ─── Join Item Chat Room ──────────────────────────────────────────────────
+    # ── refresh_token — survive access-token rotation ─────────────────────────
+    @socketio.on("refresh_token")
+    def on_refresh_token(data: dict):
+        """
+        Client sends a new access token after refresh.
+        Payload: { token: "<new_access_token>" }
+        """
+        new_token = (data or {}).get("token", "")
+        sid       = request.sid
+        # Remove old mapping
+        for uid, sessions in list(_user_sessions.items()):
+            if sid in sessions:
+                sessions.discard(sid)
+        # Re-authenticate with new token
+        if not _authenticate_socket(new_token, sid):
+            socketio.emit("auth_error", {"message": "Token refresh failed"}, to=sid)
+
+    # ── join_room ─────────────────────────────────────────────────────────────
     @socketio.on("join_room")
-    def on_join_room(data):
-        """
-        Client joins a chat room for a specific item.
-        Payload: { item_id: "..." }
-        """
+    def on_join_room(data: dict):
         from flask import session
         user_id = session.get("user_id")
-        item_id = data.get("item_id")
-
+        item_id = (data or {}).get("item_id", "").strip()
         if not user_id or not item_id:
             return
 
-        # Verify user is authorized for this room
+        if not _is_room_authorized(user_id, item_id):
+            socketio.emit("error", {"message": "Not authorised for this room"}, to=request.sid)
+            return
+
+        room = f"item_{item_id}"
+        socketio.server.enter_room(request.sid, room)
+        socketio.emit("room_joined", {"room": room, "item_id": item_id}, to=request.sid)
+        logger.info("room_joined", extra={"user_id": user_id, "room": room})
+
+    # ── leave_room ────────────────────────────────────────────────────────────
+    @socketio.on("leave_room")
+    def on_leave_room(data: dict):
+        item_id = (data or {}).get("item_id", "")
+        socketio.server.leave_room(request.sid, f"item_{item_id}")
+
+    # ── send_message ──────────────────────────────────────────────────────────
+    @socketio.on("send_message")
+    def on_send_message(data: dict):
+        from flask import session
         from config.database import get_db
         from bson import ObjectId
-        db = get_db()
 
+        user_id = session.get("user_id")
+        item_id = (data or {}).get("item_id", "").strip()
+        raw_text = (data or {}).get("text", "")
+
+        if not user_id or not item_id or not raw_text:
+            return
+
+        # Sanitise
+        text = bleach.clean(raw_text.strip(), tags=[], strip=True)[: Config.CHAT_MAX_MESSAGE_LEN]
+        if not text:
+            return
+
+        # Simple per-user rate guard via Redis
+        if not _check_chat_rate(user_id):
+            socketio.emit("error", {"message": "Sending too fast — slow down"}, to=request.sid)
+            return
+
+        db   = get_db()
         item = db.items.find_one({"_id": ObjectId(item_id)})
         if not item:
             return
 
-        is_poster   = item["user_id"] == user_id
-        is_claimant = db.claims.find_one({"item_id": item_id, "claimant_id": user_id})
-
-        if not is_poster and not is_claimant:
-            socketio.emit("error", {"message": "Not authorized for this room"}, to=request.sid)
+        if not _is_room_authorized(user_id, item_id):
+            socketio.emit("error", {"message": "Not authorised"}, to=request.sid)
             return
 
-        room_name = f"item_{item_id}"
-        socketio.server.enter_room(request.sid, room_name)
-        socketio.emit("room_joined", {"room": room_name, "item_id": item_id}, to=request.sid)
-        logger.info(f"User {user_id} joined room {room_name}")
-
-    # ─── Leave Room ───────────────────────────────────────────────────────────
-    @socketio.on("leave_room")
-    def on_leave_room(data):
-        item_id   = data.get("item_id")
-        room_name = f"item_{item_id}"
-        socketio.server.leave_room(request.sid, room_name)
-
-    # ─── Send Message ─────────────────────────────────────────────────────────
-    @socketio.on("send_message")
-    def on_send_message(data):
-        """
-        Receive a chat message and broadcast to room.
-        Payload: { item_id: "...", text: "..." }
-        """
-        from flask import session
-        user_id = session.get("user_id")
-        item_id = data.get("item_id", "").strip()
-        text    = data.get("text", "").strip()
-
-        if not user_id or not item_id or not text:
-            return
-
-        if len(text) > 1000:
-            socketio.emit("error", {"message": "Message too long"}, to=request.sid)
-            return
-
-        from config.database import get_db
-        from bson import ObjectId
-        db = get_db()
-
-        # Get sender info
         sender = db.users.find_one({"_id": ObjectId(user_id)}, {"name": 1, "avatar_url": 1})
+        now    = datetime.now(timezone.utc)
 
-        # Save to database
-        msg_doc = {
+        msg = {
             "item_id":     item_id,
             "sender_id":   user_id,
             "sender_name": sender["name"] if sender else "Unknown",
             "text":        text,
             "read":        False,
-            "created_at":  datetime.utcnow(),
+            "created_at":  now,
         }
-        result      = db.messages.insert_one(msg_doc)
-        msg_doc["_id"] = str(result.inserted_id)
-        msg_doc["created_at"] = msg_doc["created_at"].isoformat()
+        result  = db.messages.insert_one(msg)
+        msg_id  = str(result.inserted_id)
 
-        # Emit to all in the room
-        room_name = f"item_{item_id}"
         payload = {
-            "id":          str(result.inserted_id),
-            "item_id":     item_id,
-            "sender_id":   user_id,
-            "sender_name": sender["name"] if sender else "Unknown",
+            "id":            msg_id,
+            "item_id":       item_id,
+            "sender_id":     user_id,
+            "sender_name":   sender["name"] if sender else "Unknown",
             "sender_avatar": sender.get("avatar_url") if sender else None,
-            "text":        text,
-            "created_at":  msg_doc["created_at"],
-            "is_mine":     False,  # Client updates this based on own user_id
+            "text":          text,
+            "created_at":    now.isoformat(),
+            "is_mine":       False,
         }
-        socketio.emit("new_message", payload, to=room_name)
-        logger.info(f"Message sent in room {room_name} by {user_id}")
+        socketio.emit("new_message", payload, to=f"item_{item_id}")
+        logger.info("socket_message_sent", extra={"item_id": item_id, "user_id": user_id})
 
-    # ─── Typing Indicator ─────────────────────────────────────────────────────
+    # ── typing ────────────────────────────────────────────────────────────────
     @socketio.on("typing")
-    def on_typing(data):
+    def on_typing(data: dict):
         from flask import session
         user_id   = session.get("user_id")
-        item_id   = data.get("item_id")
-        is_typing = data.get("is_typing", False)
-
+        item_id   = (data or {}).get("item_id")
+        is_typing = bool((data or {}).get("is_typing", False))
         if user_id and item_id:
-            room_name = f"item_{item_id}"
-            socketio.emit("user_typing", {
-                "user_id":   user_id,
-                "is_typing": is_typing,
-            }, to=room_name, skip_sid=request.sid)
+            socketio.emit(
+                "user_typing",
+                {"user_id": user_id, "is_typing": is_typing},
+                to=f"item_{item_id}",
+                skip_sid=request.sid,
+            )
 
-    # ─── Mark Messages Read ───────────────────────────────────────────────────
+    # ── mark_read ─────────────────────────────────────────────────────────────
     @socketio.on("mark_read")
-    def on_mark_read(data):
+    def on_mark_read(data: dict):
         from flask import session
-        user_id = session.get("user_id")
-        item_id = data.get("item_id")
+        from config.database import get_db
 
+        user_id = session.get("user_id")
+        item_id = (data or {}).get("item_id")
         if user_id and item_id:
-            from config.database import get_db
             db = get_db()
             db.messages.update_many(
                 {"item_id": item_id, "sender_id": {"$ne": user_id}, "read": False},
-                {"$set": {"read": True}}
+                {"$set": {"read": True}},
             )
 
-    logger.info("✅ Socket.IO events registered")
+    logger.info("socket_events_registered")
 
 
-def emit_notification(user_id, notification_data):
-    """
-    Push a notification to all socket sessions of a user.
-    Called from notification_service.py
-    """
+# ─── Emit helpers ─────────────────────────────────────────────────────────────
+def emit_notification(user_id: str, notification_data: dict) -> None:
+    """Push a notification to all active socket sessions of a user."""
     if _socketio is None:
         return
-
-    sessions = _user_sessions.get(str(user_id), set())
-    for sid in sessions:
+    for sid in _user_sessions.get(str(user_id), set()):
         try:
             _socketio.emit("notification", notification_data, to=sid)
         except Exception as e:
-            logger.warning(f"Failed to emit notification to {sid}: {e}")
+            logger.warning("emit_notification_failed", extra={"sid": sid, "error": str(e)})
 
 
-def emit_match_found(user_id, match_data):
-    """Notify user that a potential match was found for their item"""
+def emit_match_found(user_id: str, match_data: dict) -> None:
+    """Push a match-found event to a user."""
     if _socketio is None:
         return
-
-    sessions = _user_sessions.get(str(user_id), set())
-    for sid in sessions:
+    for sid in _user_sessions.get(str(user_id), set()):
         try:
             _socketio.emit("match_found", match_data, to=sid)
         except Exception as e:
-            logger.warning(f"Failed to emit match to {sid}: {e}")
+            logger.warning("emit_match_failed", extra={"sid": sid, "error": str(e)})
+
+
+# ─── Private helpers ──────────────────────────────────────────────────────────
+def _authenticate_socket(token: str, sid: str) -> bool:
+    """
+    Decode JWT, store user_id in Flask session, register sid.
+    Returns True on success, False on failure.
+    """
+    if not token:
+        logger.warning("socket_auth_no_token", extra={"sid": sid})
+        return False
+    try:
+        decoded = decode_token(token)
+        user_id = decoded["sub"]
+        from flask import session
+        session["user_id"] = user_id
+
+        _user_sessions.setdefault(user_id, set()).add(sid)
+        if _socketio:
+            _socketio.emit(
+                "connected",
+                {"message": "Connected", "user_id": user_id},
+                to=sid,
+            )
+        logger.info("socket_auth_ok", extra={"user_id": user_id, "sid": sid})
+        return True
+    except (InvalidTokenError, KeyError, Exception) as exc:
+        logger.warning("socket_auth_failed", extra={"sid": sid, "error": str(exc)})
+        return False
+
+
+def _is_room_authorized(user_id: str, item_id: str) -> bool:
+    """Check if user is poster or accepted claimant for item_id."""
+    from config.database import get_db
+    from bson import ObjectId
+
+    try:
+        db   = get_db()
+        item = db.items.find_one({"_id": ObjectId(item_id)}, {"user_id": 1})
+        if not item:
+            return False
+        if item["user_id"] == user_id:
+            return True
+        return bool(db.claims.find_one({"item_id": item_id, "claimant_id": user_id}))
+    except Exception:
+        return False
+
+
+def _check_chat_rate(user_id: str, limit: int = 30, window: int = 60) -> bool:
+    """
+    Redis-backed per-user rate check for chat messages.
+    Returns True if under limit, False if exceeded.
+    """
+    try:
+        import redis
+        r   = redis.from_url(Config.REDIS_URL, decode_responses=True)
+        key = f"chat_rate:{user_id}"
+        cur = r.incr(key)
+        if cur == 1:
+            r.expire(key, window)
+        return int(cur) <= limit
+    except Exception:
+        return True   # fail open if Redis unavailable

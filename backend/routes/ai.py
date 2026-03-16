@@ -1,4 +1,3 @@
-
 """
 CampusLostFound - AI Routes
 POST /api/ai/analyze-gemini   - Analyze image with Google Gemini Vision

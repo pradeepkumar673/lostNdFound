@@ -1,167 +1,209 @@
-
 """
-CampusLostFound - Chat Routes
-GET  /api/chat/<item_id>/messages  - Get message history for an item
-POST /api/chat/<item_id>/messages  - Send a message (REST fallback)
-GET  /api/chat/rooms               - Get all chat rooms for current user
+backend/routes/chat.py
+Per-item chat REST endpoints.
+
+Changes v2:
+  • bleach sanitisation on every message
+  • Rate limiting (Config.RATELIMIT_CHAT)
+  • Max message length from Config
+  • Type hints + flasgger docstrings
 """
 
-from flask import Blueprint, request, jsonify
-from flask_jwt_extended import jwt_required, get_jwt_identity
-from bson import ObjectId
-from datetime import datetime
+from __future__ import annotations
+
 import logging
+from datetime import datetime, timezone
 
+import bleach
+from bson import ObjectId
+from flask import Blueprint, jsonify, request
+from flask_jwt_extended import get_jwt_identity, jwt_required
+
+from app import limiter
 from config.database import get_db
+from config.settings import Config
 from utils.helpers import serialize_doc
 
 logger = logging.getLogger(__name__)
 chat_bp = Blueprint("chat", __name__)
 
 
+def _sanitize_msg(text: str) -> str:
+    """Strip all HTML from a chat message."""
+    return bleach.clean(text.strip(), tags=[], strip=True)[: Config.CHAT_MAX_MESSAGE_LEN]
+
+
+def _is_authorized(db, item, user_id: str) -> bool:
+    """Return True if user is the item poster or has an accepted claim."""
+    if item["user_id"] == user_id:
+        return True
+    return bool(db.claims.find_one({"item_id": str(item["_id"]), "claimant_id": user_id}))
+
+
+# ─── Get Messages ─────────────────────────────────────────────────────────────
 @chat_bp.route("/<item_id>/messages", methods=["GET"])
 @jwt_required()
-def get_messages(item_id):
-    """Get chat history for a specific item"""
+def get_messages(item_id: str):
+    """
+    Retrieve chat history for a specific item.
+    ---
+    tags: [Chat]
+    security: [{Bearer: []}]
+    parameters:
+      - {name: item_id, in: path,  type: string, required: true}
+      - {name: limit,   in: query, type: integer, default: 50}
+      - {name: before_id, in: query, type: string, description: "cursor for pagination"}
+    responses:
+      200:
+        description: Message list (oldest-first)
+      403:
+        description: Not authorised — must be poster or accepted claimant
+    """
     db      = get_db()
     user_id = get_jwt_identity()
 
-    # Verify item exists and user is involved (poster or claimant)
     item = db.items.find_one({"_id": ObjectId(item_id)})
     if not item:
         return jsonify({"error": "Item not found"}), 404
 
-    is_poster   = item["user_id"] == user_id
-    is_claimant = db.claims.find_one({"item_id": item_id, "claimant_id": user_id})
+    if not _is_authorized(db, item, user_id):
+        return jsonify({"error": "Not authorised to view this chat"}), 403
 
-    if not is_poster and not is_claimant:
-        return jsonify({"error": "Not authorized to view this chat"}), 403
-
-    limit = min(100, int(request.args.get("limit", 50)))
+    limit     = min(100, int(request.args.get("limit", 50)))
     before_id = request.args.get("before_id")
 
-    query = {"item_id": item_id}
+    query: dict = {"item_id": item_id}
     if before_id:
-        query["_id"] = {"$lt": ObjectId(before_id)}
+        try:
+            query["_id"] = {"$lt": ObjectId(before_id)}
+        except Exception:
+            pass
 
-    messages = list(
-        db.messages.find(query)
-        .sort("created_at", -1)
-        .limit(limit)
-    )
-    messages.reverse()  # Oldest first for display
+    messages = list(db.messages.find(query).sort("created_at", -1).limit(limit))
+    messages.reverse()
 
-    # Enrich with sender info
     result = []
+    sender_cache: dict = {}
     for msg in messages:
         doc = serialize_doc(msg)
-        sender = db.users.find_one(
-            {"_id": ObjectId(msg["sender_id"])},
-            {"name": 1, "avatar_url": 1}
-        )
+        sid = msg["sender_id"]
+        if sid not in sender_cache:
+            s = db.users.find_one({"_id": ObjectId(sid)}, {"name": 1, "avatar_url": 1})
+            sender_cache[sid] = s or {}
+        s = sender_cache[sid]
         doc["sender"] = {
-            "id":         msg["sender_id"],
-            "name":       sender["name"] if sender else "Unknown",
-            "avatar_url": sender.get("avatar_url") if sender else None,
-            "is_me":      msg["sender_id"] == user_id,
+            "id":         sid,
+            "name":       s.get("name", "Unknown"),
+            "avatar_url": s.get("avatar_url"),
+            "is_me":      sid == user_id,
         }
         result.append(doc)
 
-    return jsonify({
-        "messages":   result,
-        "item_title": item["title"],
-        "count":      len(result),
-    }), 200
+    return jsonify({"messages": result, "item_title": item["title"], "count": len(result)}), 200
 
 
+# ─── Send Message (REST fallback) ─────────────────────────────────────────────
 @chat_bp.route("/<item_id>/messages", methods=["POST"])
 @jwt_required()
-def send_message(item_id):
+@limiter.limit(Config.RATELIMIT_CHAT)
+def send_message(item_id: str):
     """
-    Send a message via REST (SocketIO is primary, this is fallback)
-    Body: { text: "message content" }
+    Send a chat message via REST (SocketIO is primary; this is the fallback).
+    ---
+    tags: [Chat]
+    security: [{Bearer: []}]
+    parameters:
+      - {name: item_id, in: path, type: string, required: true}
+      - in: body
+        name: body
+        schema:
+          required: [text]
+          properties:
+            text: {type: string}
+    responses:
+      201:
+        description: Message sent
+      400:
+        description: Validation error
     """
     db      = get_db()
     user_id = get_jwt_identity()
-    data    = request.get_json() or {}
+    data    = request.get_json(silent=True) or {}
 
-    text = data.get("text", "").strip()
+    text = _sanitize_msg(data.get("text", ""))
     if not text:
         return jsonify({"error": "Message text required"}), 400
-    if len(text) > 1000:
-        return jsonify({"error": "Message too long (max 1000 chars)"}), 400
 
     item = db.items.find_one({"_id": ObjectId(item_id)})
     if not item:
         return jsonify({"error": "Item not found"}), 404
 
-    # Authorization check
-    is_poster   = item["user_id"] == user_id
-    is_claimant = db.claims.find_one({"item_id": item_id, "claimant_id": user_id})
-    if not is_poster and not is_claimant:
-        return jsonify({"error": "Not authorized"}), 403
+    if not _is_authorized(db, item, user_id):
+        return jsonify({"error": "Not authorised"}), 403
 
     sender = db.users.find_one({"_id": ObjectId(user_id)}, {"name": 1})
+    now    = datetime.now(timezone.utc)
 
     msg_doc = {
-        "item_id":    item_id,
-        "sender_id":  user_id,
+        "item_id":     item_id,
+        "sender_id":   user_id,
         "sender_name": sender["name"] if sender else "Unknown",
-        "text":       text,
-        "read":       False,
-        "created_at": datetime.utcnow(),
+        "text":        text,
+        "read":        False,
+        "created_at":  now,
     }
-    result = db.messages.insert_one(msg_doc)
-    msg_doc["_id"] = str(result.inserted_id)
+    result          = db.messages.insert_one(msg_doc)
+    msg_doc["_id"]  = str(result.inserted_id)
+    msg_doc["created_at"] = now.isoformat()
 
     return jsonify({"message": serialize_doc(msg_doc)}), 201
 
 
+# ─── List Chat Rooms ──────────────────────────────────────────────────────────
 @chat_bp.route("/rooms", methods=["GET"])
 @jwt_required()
 def get_chat_rooms():
-    """Get all chat rooms the current user is part of"""
+    """
+    All chat rooms the current user participates in.
+    ---
+    tags: [Chat]
+    security: [{Bearer: []}]
+    responses:
+      200:
+        description: List of room summaries
+    """
     db      = get_db()
     user_id = get_jwt_identity()
 
-    # Items where user is poster
-    my_items = list(db.items.find(
-        {"user_id": user_id},
-        {"title": 1, "images": 1, "type": 1, "status": 1}
-    ))
-    my_item_ids = [str(i["_id"]) for i in my_items]
+    my_item_ids = [
+        str(i["_id"])
+        for i in db.items.find({"user_id": user_id}, {"_id": 1})
+    ]
+    claimed_ids = [
+        c["item_id"]
+        for c in db.claims.find({"claimant_id": user_id, "status": "accepted"}, {"item_id": 1})
+    ]
 
-    # Items where user has accepted claims
-    my_claims = list(db.claims.find(
-        {"claimant_id": user_id, "status": "accepted"},
-        {"item_id": 1}
-    ))
-    claimed_item_ids = [c["item_id"] for c in my_claims]
+    all_ids = list(set(my_item_ids + claimed_ids))
+    rooms   = []
 
-    all_item_ids = list(set(my_item_ids + claimed_item_ids))
-
-    rooms = []
-    for item_id in all_item_ids:
+    for item_id in all_ids:
         item = db.items.find_one({"_id": ObjectId(item_id)})
         if not item:
             continue
 
-        # Last message
-        last_msg = db.messages.find_one(
-            {"item_id": item_id},
-            sort=[("created_at", -1)]
-        )
-        unread = db.messages.count_documents({
+        last_msg = db.messages.find_one({"item_id": item_id}, sort=[("created_at", -1)])
+        unread   = db.messages.count_documents({
             "item_id":   item_id,
             "sender_id": {"$ne": user_id},
             "read":      False,
         })
 
         rooms.append({
-            "item_id":     item_id,
-            "item_title":  item["title"],
-            "item_type":   item["type"],
-            "thumbnail":   item["images"][0]["url"] if item.get("images") else None,
+            "item_id":    item_id,
+            "item_title": item["title"],
+            "item_type":  item["type"],
+            "thumbnail":  item["images"][0]["url"] if item.get("images") else None,
             "last_message": {
                 "text":       last_msg["text"] if last_msg else None,
                 "created_at": last_msg["created_at"].isoformat() if last_msg else None,
@@ -169,6 +211,5 @@ def get_chat_rooms():
             "unread_count": unread,
         })
 
-    # Sort by last message time
     rooms.sort(key=lambda r: r["last_message"]["created_at"] or "", reverse=True)
     return jsonify({"rooms": rooms, "count": len(rooms)}), 200

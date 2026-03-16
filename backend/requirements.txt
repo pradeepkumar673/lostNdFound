@@ -1,12 +1,21 @@
+# ── Core Flask ─────────────────────────────────────────────────────────────
 flask==3.0.3
 flask-cors==5.0.0
 flask-jwt-extended==4.6.0
 flask-socketio==5.3.7
+flask-limiter==3.8.0          # Rate limiting
+Werkzeug==3.0.4
+
+# ── Database ────────────────────────────────────────────────────────────────
 pymongo==4.9.1
-python-dotenv==1.0.1
-cloudinary==1.41.0
-celery==5.4.0
 redis==5.1.1
+
+# ── Task Queue ──────────────────────────────────────────────────────────────
+celery==5.4.0
+celery[redis]==5.4.0
+flower==2.0.1                  # Celery monitoring UI
+
+# ── AI / ML ─────────────────────────────────────────────────────────────────
 google-generativeai==0.8.3
 transformers==4.45.2
 torch==2.4.1
@@ -14,6 +23,31 @@ Pillow==10.4.0
 opencv-python-headless==4.10.0.84
 pytesseract==0.3.13
 numpy==1.26.4
+
+# ── Cloud Storage ────────────────────────────────────────────────────────────
+cloudinary==1.41.0
+
+# ── HTTP / Networking ────────────────────────────────────────────────────────
 requests==2.32.3
-werkzeug==3.0.4
+urllib3==2.2.3
+
+# ── Security & Sanitization ──────────────────────────────────────────────────
+bleach==6.1.0                  # HTML/chat sanitization
+MarkupSafe==2.1.5
+
+# ── Config / Env ─────────────────────────────────────────────────────────────
+python-dotenv==1.0.1
+pydantic==2.9.2                # .env validation
+pydantic-settings==2.5.2
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+structlog==24.4.0              # Structured JSON logging
+
+# ── API Docs ─────────────────────────────────────────────────────────────────
+flasgger==0.9.7.1              # OpenAPI / Swagger UI
+
+# ── Async ────────────────────────────────────────────────────────────────────
 eventlet==0.37.0
+
+# ── Utilities ────────────────────────────────────────────────────────────────
+python-dateutil==2.9.0
